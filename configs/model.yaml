@@ -1,0 +1,26 @@
+# ---- Model basics (EPFL Meditron 7B; Llama-2 base) ----
+model_id: "epfl-llm/meditron-7b"
+trust_remote_code: true          # transformers will handle llama-2 chat template
+device_map: "auto"               # or "cuda" if single GPU
+dtype: "bfloat16"                # fallback: "float16" if no bf16
+use_flash_attention_2: false     # set true only if your env supports it (xformers/FA2)
+
+# ---- Inference defaults (safe & stable for 7B) ----
+max_new_tokens: 512
+temperature: 0.5                 # keep answers sober; raise to 0.7 for more creative text
+top_p: 0.9
+repetition_penalty: 1.05
+do_sample: true
+# Stop words usually unnecessary when using apply_chat_template + eos, but provided for safety:
+stop_words: []                   # leave empty unless you insert custom dialog markers
+
+# ---- Prompt pack wiring (English only) ----
+prompts_file: "configs/prompts_en.yaml"
+prompt_key_system: "system_en"
+prompt_key_guard:  "guardrails_en"
+prompt_key_style:  "style_en"
+
+# ---- Runtime toggles ----
+enable_few_shots: true           # set false to save context
+few_shot_keys: ["shots_triage_en"]  # which exemplar list(s) to inject, in order
+few_shot_limit: 2                # keep small for token budget
