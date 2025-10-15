@@ -1,0 +1,18 @@
+# Ignore large datasets and FAISS index files
+data/*.json
+data/*.jsonl
+rag/**/*.faiss
+rag/**/*.pkl
+
+# Cache / checkpoints
+*.pt
+*.bin
+*.ckpt
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Environment and local stuff
+.env
+.DS_Store
