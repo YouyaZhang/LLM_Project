@@ -107,9 +107,12 @@ def _build_prompt_for_stream(
         user_with_ctx = (
             f"[CONTEXT]\n{extra_system.strip()}\n\n"
             f"[QUESTION]\n{user_message.strip()}\n\n"
-            f"Instructions: Use ONLY the CONTEXT when answering. "
-            f"If insufficient, say 'insufficient context'. Cite snippet numbers like [1], [2]."
+            f"Instructions: The CONTEXT above may be useful background information. "
+            f"Use it as a reference when relevant, but you can also rely on your own knowledge "
+            f"if the context is insufficient or unrelated. "
+            f"Prefer citing snippet numbers like [1], [2] when you use the context."
         )
+
     else:
         user_with_ctx = user_message.strip()
 
@@ -243,8 +246,8 @@ def stream_reply(user_text: str, chat_history: List[List[str]]):
         user_text,
         chat_history[:-1],
         extra_system=extra_system,           # RAG 文本
-        tokenizer=tokenizer,                 # ✅ 新增
-        gen_cfg=gen_cfg,                     # ✅ 新增（里边可能有 max_new_tokens）
+        tokenizer=tokenizer,                 
+        gen_cfg=gen_cfg,                     
         model_max_input_tokens=getattr(CURRENT_MODEL.config, "max_position_embeddings", 4096),  # 兜底
     )
     inputs = tokenizer(prompt_text, return_tensors="pt")
@@ -271,10 +274,10 @@ def stream_reply(user_text: str, chat_history: List[List[str]]):
         yield chat_history
 
     # 8) Generation finished：如果启用 RAG，追加 citation 信息（写入 chat 历史，供下游解析）
-    '''if rag_enabled and citations:
+    if rag_enabled and citations:
         md = format_citations_md(citations)
         chat_history.append(["__RAG_CITATIONS__", md])
-        yield chat_history'''
+        yield chat_history
 
 # ========= UI =========
 def build_ui():
