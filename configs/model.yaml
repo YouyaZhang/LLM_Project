@@ -1,5 +1,5 @@
 # ---- Model basics (EPFL Meditron 7B; Llama-2 base) ----
-model_id: "epfl-llm/meditron-7b"
+model_id: "OpenMeditron/Meditron3-Qwen2.5-7B"
 trust_remote_code: true          # transformers will handle llama-2 chat template
 device_map: "auto"               # or "cuda" if single GPU
 dtype: "bfloat16"                # fallback: "float16" if no bf16

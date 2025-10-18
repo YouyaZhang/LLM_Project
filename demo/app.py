@@ -1,15 +1,18 @@
-# demo/app.py
+# demo/app.py  (fixed)
 from __future__ import annotations
 import os
 import threading
-from typing import List, Dict
+from typing import List, Dict, Optional, Any
 
 import gradio as gr
 import torch
 from transformers import TextIteratorStreamer
 import sys
 from pathlib import Path
+
+# make root importable
 sys.path.append(str(Path(__file__).resolve().parent.parent))
+
 from models.model_loader import load_model_from_config
 from utils.config import load_yaml
 from inference.pipeline import (
@@ -18,11 +21,7 @@ from inference.pipeline import (
     _render_with_template,
     _render_llama2_fallback,
 )
-from finetune.lora_trainer import (
-    LoraTrainConfig,
-    train_lora,
-    attach_lora_adapter,
-)
+from retrieval.retriever import DenseRetriever  
 
 CFG_PATH = "configs/model.yaml"
 
@@ -35,17 +34,18 @@ runtime = load_model_from_config(CFG_PATH)
 tokenizer = runtime.tokenizer
 base_model = runtime.model
 
-# 当前用于推理的模型（可切换为 LoRA 版本）
+# hold current model (you can later swap it for adapters)
 CURRENT_MODEL = base_model
+pipe = InferencePipeline(tokenizer=tokenizer, model=base_model, cfg=cfg, prompts=prompts)
 
-pipe = InferencePipeline(
-    tokenizer=tokenizer,
-    model=CURRENT_MODEL,        # 初始化时引用，推理时我们用全局 CURRENT_MODEL
-    cfg=cfg,
-    prompts=prompts,
-)
+# Retriever for RAG (simple file-backed retriever)
+retriever = DenseRetriever(data_dir="data")
 
-# ========= Chat helpers =========
+# ========= Utils =========
+def _model_device(m) -> torch.device:
+    """Robustly get model device (some HF models lack .device)."""
+    return getattr(m, "device", next(m.parameters()).device)
+
 def _history_pairs_to_msgs(history_pairs: List[List[str]]) -> List[Dict[str, str]]:
     """[[user, assistant], ...] -> [{'role': 'user'|'assistant', 'content': '...'}, ...]"""
     msgs: List[Dict[str, str]] = []
@@ -56,41 +56,178 @@ def _history_pairs_to_msgs(history_pairs: List[List[str]]) -> List[Dict[str, str
             msgs.append({"role": "assistant", "content": a})
     return msgs
 
-def _build_prompt_for_stream(user_message: str, history_pairs: List[List[str]]) -> str:
-    """Use same rendering path as pipeline (HF template if present, else Llama-2 fallback)."""
-    # 复用 pipeline 的消息构造（系统+guardrails+style+fewshots+历史+当前用户）
-    msgs = pipe._format_messages(user_message=user_message, history=_history_pairs_to_msgs(history_pairs))
-    if _has_chat_template(tokenizer):
-        try:
-            return _render_with_template(tokenizer, msgs)
-        except Exception:
-            return _render_llama2_fallback(msgs)
+def _compose_extra_system(citations: list | None, chunks: list | None) -> Optional[str]:
+    """
+    Build an extra system block containing retrieved texts (not仅仅是source名)以便模型真正看到内容。
+    - Prefer chunks (text bodies); fallback to citations['text'].
+    """
+    blocks: List[str] = []
+    if chunks:
+        for i, ch in enumerate(chunks):
+            text = ch.get("text") if isinstance(ch, dict) else str(ch)
+            if text:
+                blocks.append(f"[{i+1}] {text}")
+    elif citations:
+        for i, c in enumerate(citations):
+            text = (c.get("text") or "").strip()
+            src = c.get("source", "")
+            if text:
+                suff = f" (Source: {src})" if src else ""
+                blocks.append(f"[{i+1}] {text}{suff}")
+    if blocks:
+        return "Retrieved passages:\n" + "\n\n".join(blocks)
     else:
-        return _render_llama2_fallback(msgs)
+        # warning: no retrieved texts
+        print("[RAG WARN] No retrieved texts to compose extra system block.")
+        return None
+
+def _build_prompt_for_stream(
+    user_message: str,
+    history_pairs: List[List[str]],
+    extra_system: str | None = None,
+    tokenizer=None,
+    gen_cfg: dict | None = None,
+    model_max_input_tokens: int = 4096,
+) -> str:
+    """
+    目标：
+    1) 把 RAG 文本塞进用户轮，而不是第二条 system（兼容不吃多 system 的模板）；
+    2) 智能截断：优先丢最老历史，保留 [CONTEXT]+本轮问题；实在超长再截断 RAG 文本。
+
+    返回：渲染后的 prompt 文本
+    """
+    assert tokenizer is not None, "tokenizer is required for truncation"
+
+    # --- 0) 生成时预留空间，避免把输入截断到模型吐不出字 ---
+    max_new = int((gen_cfg or {}).get("max_new_tokens", 512))
+    SAFETY_MARGIN = 32                   # 给特殊符号留点空间
+    INPUT_BUDGET = max(256, model_max_input_tokens - max_new - SAFETY_MARGIN)
+
+    if extra_system and extra_system.strip():
+        user_with_ctx = (
+            f"[CONTEXT]\n{extra_system.strip()}\n\n"
+            f"[QUESTION]\n{user_message.strip()}\n\n"
+            f"Instructions: Use ONLY the CONTEXT when answering. "
+            f"If insufficient, say 'insufficient context'. Cite snippet numbers like [1], [2]."
+        )
+    else:
+        user_with_ctx = user_message.strip()
+
+    base_system = pipe.DEFAULT_SYSTEM if hasattr(pipe, "DEFAULT_SYSTEM") else "You are a helpful assistant."
+    msgs = [{"role": "system", "content": base_system}]
+    for u, a in history_pairs:
+        if u is None and a is None:
+            continue
+        if u is not None:
+            msgs.append({"role": "user", "content": str(u)})
+        if a is not None:
+            msgs.append({"role": "assistant", "content": str(a)})
+    msgs.append({"role": "user", "content": user_with_ctx})  # ✅ 本轮用户，含 RAG
+
+    def _render(mm):
+        if _has_chat_template(tokenizer):
+            try:
+                return _render_with_template(tokenizer, mm)
+            except Exception:
+                return _render_llama2_fallback(mm)
+        else:
+            return _render_llama2_fallback(mm)
+
+    prompt_text = _render(msgs)
+    input_ids = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)["input_ids"][0]
+    while input_ids.size(0) > INPUT_BUDGET and len(msgs) > 2:
+        if len(msgs) > 2:
+            del msgs[1]
+            if len(msgs) > 2 and msgs[1]["role"] == "assistant":
+                del msgs[1]
+        prompt_text = _render(msgs)
+        input_ids = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)["input_ids"][0]
+
+    if input_ids.size(0) > INPUT_BUDGET:
+
+        if msgs and msgs[-1]["role"] == "user":
+            ctx_user = msgs[-1]["content"]
+            if "[CONTEXT]" in ctx_user and "[QUESTION]" in ctx_user:
+                ctx_part, q_part = ctx_user.split("[QUESTION]", 1)
+                for limit in (2000, 1200, 800, 500, 300, 150):
+                    ctx_short = ctx_part[:limit] + " ...\n"
+                    msgs[-1]["content"] = ctx_short + "[QUESTION]" + q_part
+                    prompt_text = _render(msgs)
+                    input_ids = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)["input_ids"][0]
+                    if input_ids.size(0) <= INPUT_BUDGET:
+                        break
+
+                if input_ids.size(0) > INPUT_BUDGET:
+                    msgs[-1]["content"] = "[QUESTION]" + q_part
+                    prompt_text = _render(msgs)
+    # print("[DBG] prompt_has_RAG =", ("[CONTEXT]" in prompt_text or "Retrieved passages:" in prompt_text))
+    return prompt_text
+
+def format_citations_md(citations: List[Dict], max_chars: int = 420) -> str:
+    """
+    将 [{'text','source','score'}] 渲染为 Markdown，带 blockquote 与来源。
+    """
+    if not citations:
+        return ""
+    lines = ["### Retrieved sources"]
+    for i, c in enumerate(citations, 1):
+        txt = (c.get("text") or "").strip().replace("\n", " ")
+        if len(txt) > max_chars:
+            txt = txt[:max_chars].rstrip() + " ..."
+        src = c.get("source", "")
+        score = c.get("score", 0.0)
+        lines.append(f"\n**[{i}] Source:** `{src}`  —  **score:** {score:.3f}\n")
+        lines.append(f"> {txt}")
+    return "\n".join(lines).strip()
+
 
 # ========= Streaming chat =========
 def stream_reply(user_text: str, chat_history: List[List[str]]):
     """
-    Generator for streaming: yields updated chat_history as the assistant types.
+    Streaming generator: yields updated chat_history as the assistant types.
+    修复点：
+    - 先使用当前 msg 的值生成，再清空输入框（在 UI 绑定里处理），避免空输入传入。
+    - RAG: 将检索到的正文放入 extra_system，确保模型真的“看见”检索文本。
     """
     global CURRENT_MODEL
+
+    # 0) 防御：空输入直接回传
+    if not isinstance(user_text, str) or not user_text.strip():
+        yield chat_history
+        return
+
     # 1) Append user turn
     chat_history = chat_history + [[user_text, ""]]
     yield chat_history
 
-    # 2) Build prompt & tokenize
-    prompt_text = _build_prompt_for_stream(user_text, chat_history[:-1])
-    inputs = tokenizer(prompt_text, return_tensors="pt")
-    inputs = {k: v.to(CURRENT_MODEL.device) for k, v in inputs.items()}
+    # 2) RAG（可选）
+    rag_enabled = getattr(stream_reply, "rag_enabled", False)
+    extra_system = None
+    citations = []
+    # ---- app.py ----
 
-    # 3) Text streamer
+    if rag_enabled:
+        if rag_enabled:
+            try:
+                rag_res = pipe.generate_rag(
+                    user_message=user_text,
+                    retriever=retriever,
+                    history=_history_pairs_to_msgs(chat_history[:-1]),
+                    top_k=3,
+                )
+                citations    = rag_res.get("citations", []) or []
+                extra_system = rag_res.get("extra_system")  # ✅ 直接使用 pipeline 准备好的 extra_system
+            except Exception as e:
+                print("[RAG ERR]", e)
+                rag_enabled = False
+    
+    # 4) Text streamer 原样
     streamer = TextIteratorStreamer(
         tokenizer=tokenizer,
         skip_prompt=True,
         skip_special_tokens=True,
     )
 
-    # 4) Generation config（与 pipeline 保持一致）
     gen_cfg = {
         "do_sample": bool(cfg.get("do_sample", True)),
         "max_new_tokens": int(cfg.get("max_new_tokens", 512)),
@@ -101,8 +238,24 @@ def stream_reply(user_text: str, chat_history: List[List[str]]):
         "eos_token_id": tokenizer.eos_token_id,
         "streamer": streamer,
     }
+    # 3) Build prompt & tokenize  —— 改这里
+    prompt_text = _build_prompt_for_stream(
+        user_text,
+        chat_history[:-1],
+        extra_system=extra_system,           # RAG 文本
+        tokenizer=tokenizer,                 # ✅ 新增
+        gen_cfg=gen_cfg,                     # ✅ 新增（里边可能有 max_new_tokens）
+        model_max_input_tokens=getattr(CURRENT_MODEL.config, "max_position_embeddings", 4096),  # 兜底
+    )
+    inputs = tokenizer(prompt_text, return_tensors="pt")
+    dev = _model_device(CURRENT_MODEL)
+    inputs = {k: v.to(dev) for k, v in inputs.items()}
 
-    # 5) Background generation thread
+
+    # 5) Generation config（与 pipeline 保持一致）
+
+
+    # 6) Background generation thread
     def _worker():
         with torch.inference_mode():
             CURRENT_MODEL.generate(**inputs, **gen_cfg)
@@ -110,63 +263,18 @@ def stream_reply(user_text: str, chat_history: List[List[str]]):
     thread = threading.Thread(target=_worker, daemon=True)
     thread.start()
 
-    # 6) Yield partial text
+    # 7) Yield partial text
     partial = ""
     for new_text in streamer:
         partial += new_text
         chat_history[-1][1] = partial.strip()
         yield chat_history
 
-# ========= LoRA panel callbacks =========
-def on_train_lora(out_dir, train_path, val_path, use_4bit,
-                  lora_r, lora_alpha, lora_dropout,
-                  epochs, batch, grad_accum, lr, max_len,
-                  stream_ds, max_samples):
-    try:
-        status = "Starting LoRA training..."
-        yield status
-        cfg_train = LoraTrainConfig(
-            model_id="epfl-llm/meditron-7b",
-            prompts_path="configs/prompts_en.yaml",
-            train_path=train_path,
-            val_path=val_path if val_path and os.path.exists(val_path) else None,
-            output_dir=out_dir,
-            use_4bit=bool(use_4bit),
-            max_seq_len=int(max_len),
-            lora_r=int(lora_r),
-            lora_alpha=int(lora_alpha),
-            lora_dropout=float(lora_dropout),
-            epochs=float(epochs),
-            batch_size=int(batch),
-            grad_accum=int(grad_accum),
-            lr=float(eval(lr)),
-            stream_dataset=bool(stream_ds),
-            max_samples=int(max_samples or 0),
-        )
-        adapter_dir = train_lora(cfg_train, hf_token=os.environ.get("HF_TOKEN"))
-        status += f"\nDone. Adapter saved to: {adapter_dir}"
-        yield status
-    except Exception as e:
-        yield f"Error: {repr(e)}"
-
-def on_load_adapter(adapter_dir: str):
-    """
-    把 LoRA 适配器加载到当前模型；不重启服务。
-    """
-    global CURRENT_MODEL
-    try:
-        CURRENT_MODEL = attach_lora_adapter(base_model, adapter_dir)
-        return "Adapter loaded successfully."
-    except Exception as e:
-        return f"Load failed: {repr(e)}"
-
-def on_unload_adapter():
-    """
-    切回基础模型。
-    """
-    global CURRENT_MODEL
-    CURRENT_MODEL = base_model
-    return "Returned to base model."
+    # 8) Generation finished：如果启用 RAG，追加 citation 信息（写入 chat 历史，供下游解析）
+    '''if rag_enabled and citations:
+        md = format_citations_md(citations)
+        chat_history.append(["__RAG_CITATIONS__", md])
+        yield chat_history'''
 
 # ========= UI =========
 def build_ui():
@@ -187,7 +295,6 @@ def build_ui():
         gr.Markdown(f"# {title}")
         gr.Markdown(desc)
 
-        # Chat section
         chatbot = gr.Chatbot(
             height=520,
             show_copy_button=True,
@@ -204,88 +311,73 @@ def build_ui():
         with gr.Row():
             send_btn = gr.Button("Send ➤", variant="primary")
             clear_btn = gr.Button("🗑️ Clear")
-        with gr.Row():
-            gr.Markdown("**Try an example:**")
-        with gr.Row():
-            ex_btns = [gr.Button(e, size="sm") for e in examples]
+            rag_chk = gr.Checkbox(label="Enable RAG (retrieval-augmented)", value=False)
 
         # State for chat history
         state = gr.State([])
+        rag_debug = gr.Textbox(label="RAG citations / debug", value="", lines=6)
 
-        # Submit/Send bindings
-        def on_submit(user_text, history):
-            if not user_text or not user_text.strip():
-                return gr.update(), history
-            return gr.update(value=""), history  # clear textbox, keep state
+        # helper: set rag flag on streaming function
+        def set_rag_flag(flag: bool):
+            setattr(stream_reply, "rag_enabled", bool(flag))
+            return None
 
-        msg.submit(on_submit, [msg, state], [msg, state]).then(
-            stream_reply, [msg, state], [chatbot],
-        ).then(lambda h: h, [chatbot], [state])
+        # helper: after streaming, sync Chatbot -> state
+        def sync_state_from_chat(h):
+            return h
 
-        send_btn.click(on_submit, [msg, state], [msg, state]).then(
-            stream_reply, [msg, state], [chatbot],
-        ).then(lambda h: h, [chatbot], [state])
+        # helper: extract citations from history into rag_debug
+        def extract_citations(history_pairs: List[List[str]]):
+            dbg = ""
+            for u, a in history_pairs:
+                if u == "__RAG_CITATIONS__":
+                    dbg = a
+            return dbg
 
-        # Clear
+        # ------------- FIXED BINDINGS (顺序调整：先流式，后清空) -------------
+        # ENTER提交
+        msg.submit(
+            set_rag_flag, [rag_chk], []
+        ).then(
+            stream_reply, [msg, state], [chatbot]   # ✅ 先把当前 msg 传进去
+        ).then(
+            sync_state_from_chat, [chatbot], [state]
+        ).then(
+            lambda: "", None, [msg]                 # ✅ 再清空输入框
+        ).then(
+            extract_citations, [state], [rag_debug]
+        )
+
+        # 点击发送
+        send_btn.click(
+            set_rag_flag, [rag_chk], []
+        ).then(
+            stream_reply, [msg, state], [chatbot]   # ✅ 先流式
+        ).then(
+            sync_state_from_chat, [chatbot], [state]
+        ).then(
+            lambda: "", None, [msg]                 # ✅ 后清空
+        ).then(
+            extract_citations, [state], [rag_debug]
+        )
+
+        # 清空
         def on_clear():
-            return [], []
-        clear_btn.click(on_clear, outputs=[chatbot, state], queue=False)
+            return [], [], ""
+        clear_btn.click(on_clear, outputs=[chatbot, state, rag_debug], queue=False)
 
-        # Examples fill
-        for b in ex_btns:
-            b.click(lambda t=b.value: t, outputs=msg)
+        # 示例按钮：把示例文本填入输入框
+        for e in examples:
+            gr.Button(e, size="sm").click(lambda x=e: x, outputs=msg)
 
         gr.Markdown("---")
-
-        # LoRA fine-tuning panel
-        with gr.Accordion("🔧 LoRA fine-tuning (advanced)", open=False):
-            with gr.Row():
-                out_dir = gr.Textbox(label="Output dir", value="outputs/meditron7b-lora", scale=2)
-                train_path = gr.Textbox(label="Train JSONL", value="data/train.jsonl", scale=2)
-                val_path = gr.Textbox(label="Val JSONL (optional)", value="data/val.jsonl", scale=2)
-            with gr.Row():
-                use_4bit = gr.Checkbox(label="Use 4-bit (QLoRA)", value=True)
-                lora_r = gr.Slider(4, 64, value=16, step=1, label="LoRA r")
-                lora_alpha = gr.Slider(8, 128, value=32, step=1, label="LoRA alpha")
-                lora_dropout = gr.Slider(0.0, 0.2, value=0.05, step=0.01, label="LoRA dropout")
-            with gr.Row():
-                epochs = gr.Slider(0.5, 5.0, value=2.0, step=0.5, label="Epochs")
-                batch = gr.Slider(1, 4, value=1, step=1, label="Batch size / device")
-                grad_accum = gr.Slider(1, 64, value=16, step=1, label="Grad accumulation")
-                lr = gr.Textbox(label="Learning rate", value="2e-4")
-                max_len = gr.Slider(512, 4096, value=2048, step=128, label="Max seq length")
-            with gr.Row():
-                train_btn = gr.Button("🚀 Train LoRA", variant="primary")
-                status_box = gr.Textbox(label="Status", value="", lines=6)
-            with gr.Row():
-                stream_ds = gr.Checkbox(label="Stream dataset (low RAM)", value=True)
-                max_samples = gr.Number(label="Max samples (0=all)", value=0, precision=0)
-
-            gr.Markdown("**Load/Unload adapter**")
-            with gr.Row():
-                adapter_dir_in = gr.Textbox(label="Adapter dir", value="outputs/meditron7b-lora/adapter", scale=2)
-                load_btn = gr.Button("📦 Load LoRA Adapter")
-                unload_btn = gr.Button("♻️ Reload Base Model")
-            load_status = gr.Textbox(label="Adapter status", value="", lines=2)
-
-            # Bind train
-            train_btn.click(
-                on_train_lora,
-                inputs=[out_dir, train_path, val_path, use_4bit, lora_r, lora_alpha, lora_dropout,
-                        epochs, batch, grad_accum, lr, max_len, stream_ds, max_samples],
-                outputs=[status_box],
-            )
-
-            # Bind load/unload
-            load_btn.click(on_load_adapter, inputs=[adapter_dir_in], outputs=[load_status])
-            unload_btn.click(on_unload_adapter, outputs=[load_status])
-
         gr.Markdown(
             "— *This assistant follows strict safety guardrails: no diagnoses or dosages; "
             "seek in-person care for red-flag symptoms.*"
         )
 
     return demo
+
 
 if __name__ == "__main__":
     ui = build_ui()

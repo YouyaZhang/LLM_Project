@@ -216,3 +216,53 @@ class InferencePipeline:
             text = text[:cut].strip()
 
         return text
+
+    def generate_rag(
+        self,
+        user_message: str,
+        retriever,
+        history: Optional[List[Dict[str, str]]] = None,
+        top_k: int = 3,
+        extra_system: Optional[str] = None,
+        override_gen_cfg: Optional[dict] = None,
+    ) -> Dict[str, object]:
+        """
+        Prepare RAG context: retrieve + build extra_system.
+        DO NOT generate here. Return data for the frontend to do streaming generation once.
+        """
+        try:
+            retrieved = retriever.retrieve(user_message, top_k=top_k) or []
+        except Exception:
+            retrieved = []
+
+        # 兼容抽取 text/source/score（如需更鲁棒，可用你之前的 _extract_tss）
+        hits = []
+        for r in retrieved:
+            text  = (r.get("text") or r.get("page_content") or "").strip()
+            src   = r.get("source") or (r.get("metadata") or {}).get("source", "")
+            score = r.get("score") or 0.0
+            try:
+                score = float(score)
+            except Exception:
+                score = 0.0
+            hits.append({"text": text, "source": src, "score": score})
+
+        # 组装 extra_system
+        rag_block = None
+        if hits:
+            lines = ["Retrieved passages:"]
+            for i, h in enumerate(hits, start=1):
+                lines.append(f"[{i}] (src={h['source']}, score={h['score']:.3f})\n{h['text']}")
+            rag_block = "\n\n".join(lines)
+
+        if extra_system and rag_block:
+            extra_system = f"{extra_system}\n\n{rag_block}"
+        else:
+            extra_system = extra_system or rag_block  # 二者其一
+
+        # 不生成，返回流式所需材料
+        return {
+            "extra_system": extra_system,  # ✅ 给前端唯一一次生成使用
+            "citations": hits,             # ✅ 包含 text/source/score，供 UI 展示
+            "debug_chunks": [h["text"] for h in hits],
+        }
