@@ -3,19 +3,22 @@ import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings   # ✅ updated import
+from langchain_community.embeddings import HuggingFaceEmbeddings
 
-# Create embedding model
-emb = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
-# Load the FAISS medical index
-db = FAISS.load_local(
-    r"D:\pycharm_project\pythonProject\LLM\LLM_Project_zx\rag\rag\medical_index.faiss",  # ✅ corrected path (no double 'rag\rag')
-    emb,
-    allow_dangerous_deserialization=True
+emb = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
 
-def retrieve_context(query: str, k: int = 3) -> str:
-    """Retrieve top-k relevant medical documents from FAISS index."""
+db_path = r"rag\medical_index.faiss"
+db = FAISS.load_local(db_path, emb, allow_dangerous_deserialization=True)
+
+
+def retrieve_context(query: str, k: int = 6) -> str:
+    """
+    Retrieve top-k relevant medical documents from FAISS index.
+    Returns a concatenated string of retrieved texts.
+    """
     docs = db.similarity_search(query, k=k)
-    return "\n".join([d.page_content for d in docs])
+    context_text = "\n\n---\n\n".join([d.page_content for d in docs])
+    return context_text
